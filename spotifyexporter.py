@@ -1,209 +1,246 @@
 #!/usr/bin/env python3
+
 import os
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import pandas as pd
 from datetime import datetime
 
-# Set up your Spotify API credentials from environment variables
-SPOTIPY_CLIENT_ID = os.getenv('client_id')
-SPOTIPY_CLIENT_SECRET = os.getenv('client_secret')
-SPOTIPY_REDIRECT_URI = os.getenv('redirect_uri')
+# Timestamp for filenames
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# Authenticate with Spotify
+
+## ─── Authentication ──────────────────────────────────────────────────────────
+# Load Spotify API credentials from environment variables
+SPOTIPY_CLIENT_ID     = os.getenv('client_id')
+SPOTIPY_CLIENT_SECRET = os.getenv('client_secret')
+SPOTIPY_REDIRECT_URI  = os.getenv('redirect_uri')
+
+# Authenticate and create Spotify client
 try:
     print("Authenticating with Spotify...")
-    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(client_id=SPOTIPY_CLIENT_ID,
-                                                   client_secret=SPOTIPY_CLIENT_SECRET,
-                                                   redirect_uri=SPOTIPY_REDIRECT_URI,
-                                                   scope='user-read-private user-read-email user-library-read user-follow-read user-top-read user-read-recently-played'))
+    sp = spotipy.Spotify(
+        auth_manager=SpotifyOAuth(
+            client_id=SPOTIPY_CLIENT_ID,
+            client_secret=SPOTIPY_CLIENT_SECRET,
+            redirect_uri=SPOTIPY_REDIRECT_URI,
+            scope=(
+                'user-read-private user-read-email '
+                'user-library-read user-follow-read '
+                'user-top-read user-read-recently-played'
+            )
+        )
+    )
     print("Authentication successful.")
 except Exception as e:
     print(f"Authentication failed: {e}")
     exit()
 
-# Get user profile data
-print("Fetching user profile data...")
-user_profile = sp.current_user()
-user_data = {
-    'User ID': user_profile['id'],
-    'Display Name': user_profile['display_name'],
-    'Email': user_profile['email'],
-    'Country': user_profile['country'],
-    'Followers': user_profile['followers']['total'],
-}
 
-# Function to paginate through results
-def paginate_results(fetch_function, limit=50):
+## ─── Helper Functions ────────────────────────────────────────────────────────
+
+# Paginate through any Spotify “.items”-based endpoint
+def paginate_results(fetch_function, limit=50, **kwargs):
     results = []
     offset = 0
     while True:
-        response = fetch_function(limit=limit, offset=offset)
-        results.extend(response['items'])
-        if len(response['items']) < limit:
+        response = fetch_function(limit=limit, offset=offset, **kwargs)
+        items = response.get('items', [])
+        results.extend(items)
+        if len(items) < limit:
             break
         offset += limit
     return results
 
-# Function to get all followed artists
-def get_all_followed_artists():
-    results = []
-    limit = 50
-    after = None
+# Unified CSV export: takes a dict of DataFrames and writes them
+def export_csv(dataframes: dict, timestamp: str):
+    for name, df in dataframes.items():
+        filename = f'spotify_{name}_{timestamp}.csv'
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"{name.replace('_', ' ').title()} data saved to {filename}")
 
-    print("Fetching followed artists...")
-    while True:
-        if after:
-            response = sp.current_user_followed_artists(limit=limit, after=after)
-        else:
-            response = sp.current_user_followed_artists(limit=limit)
 
-        results.extend(response['artists']['items'])
-        if len(response['artists']['items']) < limit:
-            break
-        after = response['artists']['items'][-1]['id']
+## ─── Data-Fetching Functions ────────────────────────────────────────────────
 
-    return results
+def fetch_user_profile():
+    print("Fetching user profile data...")
+    profile = sp.current_user()
+    return {
+        'User ID':      profile['id'],
+        'Display Name': profile['display_name'],
+        'Email':        profile['email'],
+        'Country':      profile['country'],
+        'Followers':    profile['followers']['total']
+    }
 
-import time
+def fetch_saved_tracks():
+    print("Fetching saved tracks...")
+    items = paginate_results(sp.current_user_saved_tracks)
+    data = []
+    for item in items:
+        tr = item['track']
+        data.append({
+            'Track Name':    tr['name'],
+            'Artist':        ', '.join(a['name'] for a in tr['artists']),
+            'Album':         tr['album']['name'],
+            'Release Date':  tr['album']['release_date'],
+            'Duration (ms)': tr['duration_ms']
+        })
+    return data
 
-# Function to get the most recently played tracks
-def get_recently_played_tracks():
-    results = []
-    limit = 50
-
+def fetch_recently_played():
     print("Fetching recently played tracks...")
+    results = []
     try:
-        response = sp.current_user_recently_played(limit=limit)
-        if not response['items']:
-            print("No recently played tracks found.")
-            return results  # Return empty if no items are found
-
-        for item in response['items']:
-            track = item['track']
+        items = sp.current_user_recently_played(limit=50).get('items', [])
+        for item in items:
+            tr = item['track']
             results.append({
-                'Track Name': track['name'],
-                'Artist': ', '.join(artist['name'] for artist in track['artists']),
-                'Album': track['album']['name'],
-                'Played At': item['played_at'],
+                'Track Name': tr['name'],
+                'Artist':     ', '.join(a['name'] for a in tr['artists']),
+                'Album':      tr['album']['name'],
+                'Played At':  item['played_at']
             })
-
         print(f"Retrieved {len(results)} recently played tracks.")
     except Exception as e:
         print(f"Error fetching recently played tracks: {e}")
-
     return results
 
-# Get saved tracks
-print("Fetching saved tracks...")
-saved_tracks = paginate_results(sp.current_user_saved_tracks)
-tracks_data = []
-for item in saved_tracks:
-    track = item['track']
-    tracks_data.append({
-        'Track Name': track['name'],
-        'Artist': ', '.join(artist['name'] for artist in track['artists']),
-        'Album': track['album']['name'],
-        'Release Date': track['album']['release_date'],
-        'Duration (ms)': track['duration_ms'],
-    })
+def fetch_followed_artists():
+    print("Fetching followed artists...")
+    items = []
+    after = None
+    while True:
+        resp = sp.current_user_followed_artists(limit=50, after=after)
+        batch = resp['artists']['items']
+        items.extend(batch)
+        if len(batch) < 50:
+            break
+        after = batch[-1]['id']
+    data = []
+    for art in items:
+        data.append({
+            'Artist Name': art['name'],
+            'Artist ID':   art['id'],
+            'Genres':      ', '.join(art['genres']),
+            'Followers':   art['followers']['total'],
+            'Popularity':  art['popularity']
+        })
+    return data
 
-# Get recently played tracks
-recent_tracks_data = get_recently_played_tracks()
-print(f"Retrieved {len(recent_tracks_data)} recently played tracks.")
+def fetch_playlists():
+    print("Fetching user playlists...")
+    items = paginate_results(sp.current_user_playlists)
+    data = []
+    for pl in items:
+        data.append({
+            'Playlist ID':   pl['id'],
+            'Playlist Name': pl['name'],
+            'Description':   pl.get('description', ''),
+            'Tracks Count':  pl['tracks']['total'],
+            'Public':        pl['public']
+        })
+    return data
 
-# Get followed artists
-followed_artists = get_all_followed_artists()
-artists_data = []
-print(f"Retrieved {len(followed_artists)} followed artists.")
+def fetch_playlist_tracks(playlist_id, playlist_name):
+    limit, offset = 100, 0
+    records = []
+    while True:
+        resp = sp.playlist_items(
+            playlist_id,
+            offset=offset,
+            limit=limit,
+            fields=(
+                'items('
+                    'added_by(id),added_at,'
+                    'track(name,artists(name),album(name),duration_ms)'
+                '),total'
+            )
+        )
+        items = resp.get('items', [])
+        if not items:
+            break
+        for item in items:
+            tr = item.get('track', {})
+            ab = item.get('added_by') or {}
+            records.append({
+                'Playlist ID':    playlist_id,
+                'Playlist Name':  playlist_name,
+                'Track Name':     tr.get('name', ''),
+                'Artist':         ', '.join(a.get('name','') for a in tr.get('artists', [])),
+                'Album':          tr.get('album', {}).get('name', ''),
+                'Duration (ms)':  tr.get('duration_ms', 0),
+                'Added By ID':    ab.get('id', 'Unknown'),
+                'Added At':       item.get('added_at', 'Unknown')
+            })
+        offset += limit
+        if len(items) < limit:
+            break
+    return records
 
-for artist in followed_artists:
-    artists_data.append({
-        'Artist Name': artist['name'],
-        'Artist ID': artist['id'],
-        'Genres': ', '.join(artist['genres']),
-        'Followers': artist['followers']['total'],
-        'Popularity': artist['popularity'],
-    })
+def fetch_top_artists():
+    print("Fetching top artists...")
+    items = paginate_results(sp.current_user_top_artists, limit=50)
+    data = []
+    for art in items:
+        data.append({
+            'Artist Name': art['name'],
+            'Genres':      ', '.join(art['genres']),
+            'Followers':   art['followers']['total'],
+            'Popularity':  art['popularity']
+        })
+    return data
 
-# Get user playlists
-print("Fetching user playlists...")
-playlists = paginate_results(sp.current_user_playlists)
-playlists_data = []
-for item in playlists:
-    playlists_data.append({
-        'Playlist Name': item['name'],
-        'Description': item.get('description', 'No description available'),
-        'Tracks Count': item['tracks']['total'],
-        'Public': item['public'],
-    })
+def fetch_saved_albums():
+    print("Fetching saved albums...")
+    items = paginate_results(sp.current_user_saved_albums)
+    data = []
+    for item in items:
+        alb = item['album']
+        data.append({
+            'Album Name':   alb['name'],
+            'Artist':       ', '.join(a['name'] for a in alb['artists']),
+            'Release Date': alb['release_date'],
+            'Total Tracks': alb['total_tracks']
+        })
+    return data
 
-# Get top artists
-print("Fetching top artists...")
-top_artists = paginate_results(sp.current_user_top_artists, limit=50)
-top_artists_data = []
-print(f"Retrieved {len(top_artists)} top artists.")
 
-for artist in top_artists:
-    top_artists_data.append({
-        'Artist Name': artist['name'],
-        'Genres': ', '.join(artist['genres']),
-        'Followers': artist['followers']['total'],
-        'Popularity': artist['popularity'],
-    })
+## ─── Main Execution ─────────────────────────────────────────────────────────
 
-# Get saved albums
-print("Fetching saved albums...")
-saved_albums = paginate_results(sp.current_user_saved_albums)
-albums_data = []
-print(f"Retrieved {len(saved_albums)} saved albums.")
+# Fetch all data
+user_data         = fetch_user_profile()
+tracks_data       = fetch_saved_tracks()
+recent_data       = fetch_recently_played()
+artists_data      = fetch_followed_artists()
+playlists_meta    = fetch_playlists()
 
-for item in saved_albums:
-    album = item['album']
-    albums_data.append({
-        'Album Name': album['name'],
-        'Artist': ', '.join(artist['name'] for artist in album['artists']),
-        'Release Date': album['release_date'],
-        'Total Tracks': album['total_tracks'],
-    })
+# Fetch tracks for each playlist
+print("Fetching tracks for each playlist...")
+playlist_tracks = []
+for pl in playlists_meta:
+    print(f"  • {pl['Playlist Name']}...")
+    playlist_tracks.extend(
+        fetch_playlist_tracks(pl['Playlist ID'], pl['Playlist Name'])
+    )
 
-# Create DataFrames
-print("Creating DataFrames for the collected data...")
-user_df = pd.DataFrame([user_data])
-tracks_df = pd.DataFrame(tracks_data)
-artists_df = pd.DataFrame(artists_data)
-playlists_df = pd.DataFrame(playlists_data)
-top_artists_df = pd.DataFrame(top_artists_data)
-recent_tracks_df = pd.DataFrame(recent_tracks_data)
-albums_df = pd.DataFrame(albums_data)
+top_artists_data  = fetch_top_artists()
+saved_albums_data = fetch_saved_albums()
 
-# Generate a timestamp for file naming
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# Save to CSV with timestamp and provide feedback
-try:
-    print("Saving data to CSV files...")
-    user_df.to_csv(f'spotify_user_data_{timestamp}.csv', index=False)
-    print(f"User data saved to spotify_user_data_{timestamp}.csv")
-    
-    tracks_df.to_csv(f'spotify_saved_tracks_{timestamp}.csv', index=False)
-    print(f"Saved tracks data saved to spotify_saved_tracks_{timestamp}.csv")
-    
-    artists_df.to_csv(f'spotify_followed_artists_{timestamp}.csv', index=False)
-    print(f"Followed artists data saved to spotify_followed_artists_{timestamp}.csv")
-    
-    playlists_df.to_csv(f'spotify_playlists_{timestamp}.csv', index=False)
-    print(f"Playlists data saved to spotify_playlists_{timestamp}.csv")
-    
-    top_artists_df.to_csv(f'spotify_top_artists_{timestamp}.csv', index=False)
-    print(f"Top artists data saved to spotify_top_artists_{timestamp}.csv")
-    
-    recent_tracks_df.to_csv(f'spotify_recently_played_tracks_{timestamp}.csv', index=False)
-    print(f"Recently played tracks data saved to spotify_recently_played_tracks_{timestamp}.csv")
-    
-    albums_df.to_csv(f'spotify_saved_albums_{timestamp}.csv', index=False)
-    print(f"Saved albums data saved to spotify_saved_albums_{timestamp}.csv")
-    
-    print("All data has been successfully exported to CSV files.")
-except Exception as e:
-    print(f"An error occurred while saving data to CSV files: {e}")
+# Prepare DataFrames
+frames = {
+    'user_data':                      pd.DataFrame([user_data]),
+    'saved_tracks':                   pd.DataFrame(tracks_data),
+    'recently_played_tracks':         pd.DataFrame(recent_data),
+    'followed_artists':               pd.DataFrame(artists_data),
+    'playlists':                      pd.DataFrame(playlists_meta),
+    'playlist_tracks':                pd.DataFrame(playlist_tracks),
+    'top_artists':                    pd.DataFrame(top_artists_data),
+    'saved_albums':                   pd.DataFrame(saved_albums_data),
+}
+
+# Export everything to CSV
+export_csv(frames, timestamp)
+
+print("All data has been successfully exported.")
